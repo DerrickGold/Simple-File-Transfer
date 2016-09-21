@@ -62,6 +62,7 @@ int sendReady(int sockfd) {
 int waitForReady(int sockfd) {
   printf("wait for ready start\n");
   char buffer[strlen(READY_MSG) + 1];
+  memset(buffer, 0, sizeof(buffer));
   recv(sockfd, buffer, sizeof(buffer), 0);
   printf("wait for ready: %s\n", buffer);
   return !strcmp(buffer, READY_MSG);
@@ -428,11 +429,7 @@ void client(const char *server, const char *port, int argc, char *argv[], int of
 
       if (file.type == FILETYPE_FILE) {
         file.path = basename(curFile);
-        
       }
-
-
-      
       unsigned int size = 0;
       char *packet = makePacket(&file, &size);
       sendPacket(servSock, packet, size);
