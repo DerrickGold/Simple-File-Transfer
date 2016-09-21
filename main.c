@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <libgen.h>
 
 #define TEST_PORT "13337"
 #define BACK_LOG 10
@@ -44,6 +45,7 @@ typedef struct FileMetaData {
   unsigned int pathLen;
   FileMetaDataType type;
   char *path;
+  char *localPath;
 } FileMetaData;
 
 
@@ -341,13 +343,13 @@ int serverInit(const char *port, struct addrinfo **res, const char *directory) {
 }
 
 
-void server(void) {
+void server(char *port) {
   printf("STARTING SERVER MODE\n\n\n");
   struct addrinfo *res;
   struct sockaddr_storage clientAddr;
   socklen_t clientAddrSize = sizeof(clientAddr);
   
-  int listenFd = serverInit(TEST_PORT, &res, NULL);
+  int listenFd = serverInit(port, &res, NULL);
   if (listenFd < 0) exit(1);
 
   char keepAlive = 1;
@@ -403,26 +405,33 @@ int clientInit(const char *addr, const char *port, struct addrinfo **res) {
 }
 
 
-void client(int argc, char *argv[]) {
+void client(const char *server, const char *port, int argc, char *argv[], int offset) {
   printf("STARTING CLIENT MODE\n\n\n");
   struct addrinfo *res;
-  int servSock = clientInit("127.0.0.1", TEST_PORT, &res);
+  int servSock = clientInit(server, port, &res);
   if (servSock < 0) exit(1);
   
   ClientStates curState = CLIENT_SEND_META;
-  int curFile = 1;
   char keepAlive = 1;
-
+  char *curFile;
   FileMetaData file;
   while (keepAlive) {
     switch(curState) {
     case CLIENT_SEND_META: {
-      
+      curFile = argv[offset++];
+
       file = (FileMetaData) {
-        .pathLen = strlen(argv[curFile]),
+        .pathLen = strlen(curFile),
         .type = FILETYPE_FILE,
-        .path = argv[curFile]
+        .localPath = curFile
       };
+
+      if (file.type == FILETYPE_FILE) {
+        file.path = basename(curFile);
+        
+      }
+
+
       
       unsigned int size = 0;
       char *packet = makePacket(&file, &size);
@@ -434,7 +443,7 @@ void client(int argc, char *argv[]) {
       if (waitForReady(servSock)) curState = CLIENT_SEND_FILE;
       break;
     case CLIENT_SEND_FILE:
-      sendFile(servSock, file.path);
+      sendFile(servSock, file.localPath);
       curState = CLIENT_FILE_SENT;
       break;
     case CLIENT_FILE_SENT:
@@ -448,8 +457,24 @@ void client(int argc, char *argv[]) {
 
 int main(int argc, char *argv[]) {
 
-  if (argc < 2) server();
-  else client(argc, argv);
+  char *addr = NULL, *port = NULL;
+  int opt;
+  while ((opt = getopt(argc, argv, "s:p:")) != -1) {
+    switch (opt) {
+    case 's':
+      addr = optarg;
+      break;
+    case 'p':
+      port = optarg;
+      break;
+    }
+  }
+
+  if (!addr) addr = "127.0.0.1";
+  if (!port) port = TEST_PORT;
+  
+  if (argc < 2) server(port);
+  else client(addr, port, argc, argv, optind);
 
   return 0;
 }
