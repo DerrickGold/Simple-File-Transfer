@@ -15,11 +15,10 @@
 
 #define TEST_PORT "13337"
 #define BACK_LOG 10
-#define DATA_BUFFER_LEN 1024
-#define PACKET_HEADER_LEN (sizeof(unsigned int) + sizeof(FileMetaDataType))
+#define DATA_BUFFER_LEN 4096
 
-#define READY_MSG "OK"
-
+typedef unsigned int SendHeader;
+#define HEADER_SIZE (sizeof(SendHeader))
 
 typedef enum {
   SERVER_WAITING_CON = 0,
@@ -49,28 +48,6 @@ typedef struct FileMetaData {
 } FileMetaData;
 
 
-typedef struct Packet {
-  unsigned int len;
-  unsigned int metadataLen;
-  char *metadata;
-} Packet;
-
-int sendReady(int sockfd) {
-  return send(sockfd, READY_MSG, strlen(READY_MSG), 0);
-}
-
-int waitForReady(int sockfd) {
-  printf("wait for ready start\n");
-  char buffer[strlen(READY_MSG) + 1];
-  memset(buffer, 0, sizeof(buffer));
-  recv(sockfd, buffer, sizeof(buffer), 0);
-  printf("wait for ready: %s\n", buffer);
-  return !strcmp(buffer, READY_MSG);
-}
-
-
-
-
 char *packUInt(char *out, unsigned int in) {
   *out++ = in >> 24;
   *out++ = in >> 16;
@@ -87,6 +64,42 @@ char *unpackUInt(unsigned int *out, char *in) {
 
   return &in[3];
 }
+
+int unpackSendHeader(char *data, SendHeader *header) {
+  unsigned int size = 0;
+  unpackUInt(&size, data);
+  *header = size;
+  return 0;
+}
+
+unsigned int packSendHeader(char *out, SendHeader *header) {
+	packUInt(out, *header);
+  return HEADER_SIZE;
+}
+
+unsigned int prependSendHeader(char **wrapped, char *inputData, unsigned int len) {
+  SendHeader header = len;
+  char *out = NULL;
+  
+  *wrapped = calloc(1, header + HEADER_SIZE);
+  if (!*wrapped) {
+    fprintf(stderr, "Error prepending send header!\n");
+    return -1;
+  }
+  out = *wrapped;
+  packSendHeader(out, &header);
+  memcpy(out + HEADER_SIZE, inputData, len);
+  return len + HEADER_SIZE;
+}
+
+int getHeader(int sockfd, SendHeader *header) {
+  char headerBuf[HEADER_SIZE];
+  int n = recv(sockfd, headerBuf, sizeof(headerBuf), 0);
+  if (n == -1 || n == 0) return n;
+  if (unpackSendHeader(headerBuf, header)) return -1;
+  return 0;
+}
+
 
 
 char *packFileMetadata(FileMetaData *metaData, unsigned int *len) {
@@ -127,43 +140,23 @@ void unpackFileMetadata(FileMetaData *metaData, char *input) {
 }
 
 
+char *makeFileData(FileMetaData *metaData, unsigned int *size) {
+  unsigned int totalLen, metaLen;
+  char *output = NULL, *packed = NULL, *pos = NULL;
 
-char *makePacket(FileMetaData *metaData, unsigned int *size) {
-  char *packed = NULL;
-  Packet *newPacket = calloc(1, sizeof(Packet));
-  if (!newPacket) {
-    fprintf(stderr, "Error initializing new packet!\n");
-    return NULL;
-  }
-
-  newPacket->metadata = packFileMetadata(metaData, &newPacket->metadataLen);
-  if (!newPacket->metadata) {
-    free(newPacket);
-    return NULL;
-  }
-  newPacket->len = sizeof(Packet) + newPacket->metadataLen;
-  *size = newPacket->len;
+  packed = packFileMetadata(metaData, &metaLen);
+  if (!packed) return NULL;
+  printf("PACKED: %s\n", packed);
   
-  packed = calloc(1, newPacket->len);
-  if (!packed) {
-    fprintf(stderr, "Error serializing packet!\n");
-    free(newPacket);
-    return NULL;
-  }
-
-  char *pos = packed;
-  pos = packUInt(pos, newPacket->len) + 1;
-  pos = packUInt(pos, newPacket->metadataLen) + 1;
-  memcpy(pos, newPacket->metadata, newPacket->metadataLen);
-  free(newPacket);
-  return packed;
+  totalLen = prependSendHeader(&output, packed, metaLen);
+  printf("HEADER: %s\n", output);
+  free(packed);
+  *size = totalLen;
+  return output;
 }
 
-int sendPacket(int sockfd, char *data, unsigned int len) {
-  int total = 0;
-  int bytesLeft = len;
-  int n;
-
+int sendPackedData(int sockfd, char *data, unsigned int len) {
+  int total = 0, bytesLeft = len, n;
   while (total < len) {
     n = send(sockfd, data+total, bytesLeft, 0);
     if (n == -1) break;
@@ -174,19 +167,28 @@ int sendPacket(int sockfd, char *data, unsigned int len) {
 }
 
 int sendFile(int sockfd, const char *path) {
+  SendHeader header;
   struct stat st;
-  stat(path, &st);
+  unsigned int fileSize;
+  char headerBuf[HEADER_SIZE];
 
+  //get file size
+  stat(path, &st);
   FILE *f = fopen(path, "rb");
   if (!f) {
     perror("file error: ");
     return -1;
   }
-  
-  size_t fileSize = st.st_size;
+
+  //send header first
+	header = fileSize = st.st_size;
+  packSendHeader(headerBuf, &header);
+  send(sockfd, headerBuf, HEADER_SIZE, 0); 
+
   unsigned int sent = 0, read = 0;
   int n = 0, b = 0;
   char buffer[DATA_BUFFER_LEN];
+  
   while (sent < fileSize) {
     b = fread(buffer, 1, sizeof(buffer), f);
     if (!b) break;
@@ -200,47 +202,38 @@ int sendFile(int sockfd, const char *path) {
 }
 
 
-int recvPacket(int sockfd, Packet *packet, FileMetaData *m) {
-
+int recvPacket(int sockfd, FileMetaData *m) {
   char tempBuffer[DATA_BUFFER_LEN];
-  char *finalPacket = NULL;
-  char *writePos = finalPacket;
-  unsigned int retrieved = 0, received = -1;
-  while (received) {
-    received = recv(sockfd, tempBuffer, sizeof(tempBuffer), 0);
-    printf("RECEIVED: %d\n", received);
-    if (received == -1 || received == 0) break;
-    
-    if (!finalPacket && received > 0) {
-      unpackUInt(&packet->len, tempBuffer);
-      finalPacket = calloc(1, packet->len);
-      if (!finalPacket) {
-        fprintf(stderr, "Error receiving packet size: %d\n", packet->len);
-        exit(1);
-      }
-      writePos = finalPacket;
-    }
-    if (finalPacket && received > 0) {
-      unsigned int readlen = received;
-      if (retrieved > packet->len) readlen = received - (retrieved - packet->len);
-      memcpy(writePos, tempBuffer, readlen);
-    }
+  char *finalPacket = NULL, *writePos;
+  unsigned int n, bytesLeft = 0;
+
+  SendHeader header;
+  if (getHeader(sockfd, &header)) {
+    fprintf(stderr, "Error receiving send header\n");
+    exit(1);
+  }
+  bytesLeft = (unsigned int)header;
+  
+  finalPacket = calloc(1, bytesLeft);
+  if (!finalPacket) {
+    fprintf(stderr, "Not enough memory to receive data!\n");
+    exit(1);
+  }
+  writePos = finalPacket;
+  while (bytesLeft > 0) {
+    unsigned int readSize = (bytesLeft < DATA_BUFFER_LEN) ? bytesLeft : DATA_BUFFER_LEN;
+    n = recv(sockfd, tempBuffer, readSize, 0);
+    if (n == -1 || n == 0) break;
    
-    retrieved += received;
-    if (retrieved >= packet->len) break;
-    
+    memcpy(writePos, tempBuffer, n);
+    bytesLeft -= n;
+    writePos += n;
   }
-  if (finalPacket && retrieved >= packet->len) {
-    char *read = finalPacket;
-    read = unpackUInt(&packet->len, read) + 1;
-    read = unpackUInt(&packet->metadataLen, read) + 1;
-    unpackFileMetadata(m, read);
-  }
+  unpackFileMetadata(m, finalPacket);
   return 0;
 }
 
 int recvFile(int sockfd, FileMetaData *m) {
-
   char tempPath[strlen(m->path) + strlen("TEST")];
   sprintf(tempPath, "TEST%s", m->path);
   FILE *f = fopen(tempPath, "wb");
@@ -248,14 +241,23 @@ int recvFile(int sockfd, FileMetaData *m) {
     perror("File open: ");
     return -1;
   }
-
   int n = -1;
   char buffer[DATA_BUFFER_LEN];
-  while (n) {
-    memset(buffer, 0, sizeof(buffer));
-    n = recv(sockfd, buffer, sizeof(buffer), 0);
+
+
+  SendHeader header;
+  if (getHeader(sockfd, &header)) {
+    fprintf(stderr, "Error receiving send header\n");
+    exit(1);
+  }
+  unsigned int bytesLeft = (unsigned int)header;
+  while (bytesLeft > 0) {
+    unsigned int readSize = (bytesLeft < DATA_BUFFER_LEN) ? bytesLeft : DATA_BUFFER_LEN;
+    n = recv(sockfd, buffer, readSize, 0);
+    
     if (n == -1 || n == 0) break;
     fwrite(buffer, 1, n, f);
+    bytesLeft -= n;
   }
   fclose(f);
 
@@ -371,10 +373,8 @@ void server(char *port) {
       break;
       //Client connected, nothing happening
     case SERVER_CLIENT_CON: {
-      Packet packet;
       memset(&nfile, 0, sizeof(nfile));
-      recvPacket(clientSockFd, &packet, &nfile);
-      sendReady(clientSockFd);
+      recvPacket(clientSockFd, &nfile);
       curState = SERVER_CLIENT_TRANSFER;
     }break;
       //Client sending data to server
@@ -405,7 +405,6 @@ int clientInit(const char *addr, const char *port, struct addrinfo **res) {
   return sockfd;
 }
 
-
 void client(const char *server, const char *port, int argc, char *argv[], int offset) {
   printf("STARTING CLIENT MODE\n\n\n");
   struct addrinfo *res;
@@ -431,13 +430,13 @@ void client(const char *server, const char *port, int argc, char *argv[], int of
         file.path = basename(curFile);
       }
       unsigned int size = 0;
-      char *packet = makePacket(&file, &size);
-      sendPacket(servSock, packet, size);
+      char *packet = makeFileData(&file, &size);
+      sendPackedData(servSock, packet, size);
       curState = CLIENT_META_SENT;
     }break;
     case CLIENT_META_SENT:
       printf("metadata sent, waiting back\n");
-      if (waitForReady(servSock)) curState = CLIENT_SEND_FILE;
+      curState = CLIENT_SEND_FILE;
       break;
     case CLIENT_SEND_FILE:
       sendFile(servSock, file.localPath);
