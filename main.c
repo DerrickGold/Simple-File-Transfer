@@ -17,7 +17,7 @@
 #define BACK_LOG 10
 #define DATA_BUFFER_LEN 4096
 
-typedef unsigned int SendHeader;
+typedef size_t SendHeader;
 #define HEADER_SIZE (sizeof(SendHeader))
 
 typedef enum {
@@ -47,6 +47,31 @@ typedef struct FileMetaData {
   char *localPath;
 } FileMetaData;
 
+char *packUInt64(char *out, unsigned long long in) {
+  *out++ = (unsigned long long) in >> 56;
+  *out++ = (unsigned long long) in >> 48;
+  *out++ = (unsigned long long) in >> 40;
+  *out++ = (unsigned long long) in >> 32;
+  *out++ = in >> 24;
+  *out++ = in >> 16;
+  *out++ = in >> 8;
+  *out = in;
+  return out;
+}
+
+char *unpackUInt64(unsigned long long *out, char *in) {
+  *out = (unsigned long long)in[0] << 56 |
+    (unsigned long long)in[1] << 48 |
+    (unsigned long long)in[2] << 40 |
+    (unsigned long long)in[3] << 32 |
+    in[4] << 24 |
+    in[5] << 16 |
+    in[6] << 8 |
+    in[7];
+
+  return &in[7];
+}
+
 
 char *packUInt(char *out, unsigned int in) {
   *out++ = in >> 24;
@@ -65,19 +90,34 @@ char *unpackUInt(unsigned int *out, char *in) {
   return &in[3];
 }
 
+char *packSizeT(char *out, size_t in) {
+  if (sizeof(size_t) == 8)
+    return packUInt64(out, in);
+
+  return packUInt(out, in);
+}
+
+char *unpackSizeT(size_t *out, char *in) {
+if (sizeof(size_t) == 8)
+  return unpackUInt64((unsigned long long *)out, in);
+
+ return unpackUInt((unsigned int *)out, in);
+}
+
+
 int unpackSendHeader(char *data, SendHeader *header) {
-  unsigned int size = 0;
-  unpackUInt(&size, data);
+  size_t size = 0;
+  unpackSizeT(&size, data);
   *header = size;
   return 0;
 }
 
 unsigned int packSendHeader(char *out, SendHeader *header) {
-	packUInt(out, *header);
+  packSizeT(out, *header);
   return HEADER_SIZE;
 }
 
-unsigned int prependSendHeader(char **wrapped, char *inputData, unsigned int len) {
+size_t prependSendHeader(char **wrapped, char *inputData, unsigned int len) {
   SendHeader header = len;
   char *out = NULL;
   
@@ -102,9 +142,9 @@ int getHeader(int sockfd, SendHeader *header) {
 
 
 
-char *packFileMetadata(FileMetaData *metaData, unsigned int *len) {
+char *packFileMetadata(FileMetaData *metaData, size_t *len) {
   printf("PACKING METADATA\n");
-  size_t headerSize = sizeof(unsigned int) + sizeof(FileMetaDataType);
+  size_t headerSize = sizeof(unsigned long) + sizeof(FileMetaDataType);
   *len = headerSize + metaData->pathLen;
   char *serialized = calloc(1, *len);
   char *pos = serialized;
@@ -123,7 +163,6 @@ char *packFileMetadata(FileMetaData *metaData, unsigned int *len) {
 }
 
 void unpackFileMetadata(FileMetaData *metaData, char *input) {
-
   printf("UNPACKING METADATA\n");
   input = unpackUInt(&metaData->pathLen, input) + 1;
   printf("Path Len: %d\n", metaData->pathLen);
@@ -140,8 +179,8 @@ void unpackFileMetadata(FileMetaData *metaData, char *input) {
 }
 
 
-char *makeFileData(FileMetaData *metaData, unsigned int *size) {
-  unsigned int totalLen, metaLen;
+char *makeFileData(FileMetaData *metaData, size_t *size) {
+  size_t totalLen, metaLen;
   char *output = NULL, *packed = NULL, *pos = NULL;
 
   packed = packFileMetadata(metaData, &metaLen);
@@ -155,8 +194,9 @@ char *makeFileData(FileMetaData *metaData, unsigned int *size) {
   return output;
 }
 
-int sendPackedData(int sockfd, char *data, unsigned int len) {
-  int total = 0, bytesLeft = len, n;
+int sendPackedData(int sockfd, char *data, size_t len) {
+  size_t total = 0, bytesLeft = len;
+  int n = 0;
   while (total < len) {
     n = send(sockfd, data+total, bytesLeft, 0);
     if (n == -1) break;
@@ -169,7 +209,7 @@ int sendPackedData(int sockfd, char *data, unsigned int len) {
 int sendFile(int sockfd, const char *path) {
   SendHeader header;
   struct stat st;
-  unsigned int fileSize;
+  size_t fileSize;
   char headerBuf[HEADER_SIZE];
 
   //get file size
@@ -179,13 +219,14 @@ int sendFile(int sockfd, const char *path) {
     perror("file error: ");
     return -1;
   }
-
+  printf("Sending %lld bytes\n", st.st_size);
   //send header first
-	header = fileSize = st.st_size;
+	fileSize = st.st_size;
+  header = fileSize;
   packSendHeader(headerBuf, &header);
-  send(sockfd, headerBuf, HEADER_SIZE, 0); 
+  send(sockfd, headerBuf, sizeof(headerBuf), 0); 
 
-  unsigned int sent = 0, read = 0;
+  size_t sent = 0, read = 0;
   int n = 0, b = 0;
   char buffer[DATA_BUFFER_LEN];
   
@@ -195,7 +236,7 @@ int sendFile(int sockfd, const char *path) {
     n = send(sockfd, buffer, b, 0);
     if (!n || n == -1) break;
     read += b;
-    sent += n;
+    sent += b;
   }
   fclose(f);
   return 0;
@@ -205,7 +246,8 @@ int sendFile(int sockfd, const char *path) {
 int recvPacket(int sockfd, FileMetaData *m) {
   char tempBuffer[DATA_BUFFER_LEN];
   char *finalPacket = NULL, *writePos;
-  unsigned int n, bytesLeft = 0;
+  size_t bytesLeft = 0;
+  int n = 0;
 
   SendHeader header;
   if (getHeader(sockfd, &header)) {
@@ -243,16 +285,16 @@ int recvFile(int sockfd, FileMetaData *m) {
   }
   int n = -1;
   char buffer[DATA_BUFFER_LEN];
-
-
   SendHeader header;
+  
   if (getHeader(sockfd, &header)) {
     fprintf(stderr, "Error receiving send header\n");
     exit(1);
   }
-  unsigned int bytesLeft = (unsigned int)header;
+  size_t bytesLeft = (size_t)header;
+  printf("Recieving file: %zu bytes.\n", bytesLeft);
   while (bytesLeft > 0) {
-    unsigned int readSize = (bytesLeft < DATA_BUFFER_LEN) ? bytesLeft : DATA_BUFFER_LEN;
+    size_t readSize = (bytesLeft < DATA_BUFFER_LEN) ? bytesLeft : DATA_BUFFER_LEN;
     n = recv(sockfd, buffer, readSize, 0);
     
     if (n == -1 || n == 0) break;
@@ -429,7 +471,7 @@ void client(const char *server, const char *port, int argc, char *argv[], int of
       if (file.type == FILETYPE_FILE) {
         file.path = basename(curFile);
       }
-      unsigned int size = 0;
+      size_t size = 0;
       char *packet = makeFileData(&file, &size);
       sendPackedData(servSock, packet, size);
       curState = CLIENT_META_SENT;
@@ -452,7 +494,6 @@ void client(const char *server, const char *port, int argc, char *argv[], int of
 
 
 int main(int argc, char *argv[]) {
-
   char *addr = NULL, *port = NULL;
   int opt;
   while ((opt = getopt(argc, argv, "s:p:")) != -1) {
